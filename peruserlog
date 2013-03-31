@@ -1,4 +1,18 @@
-#!/usr/local/bin/perl -w
+#!/usr/bin/env perl -w
+
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#                    Version 2, December 2004
+#
+# Copyright (C) 2004 Sam Hocevar <sam@hocevar.net>
+#
+# Everyone is permitted to copy and distribute verbatim or modified
+# copies of this license document, and changing it is allowed as long
+# as the name is changed.
+#
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+#
+#  0. You just DO WHAT THE FUCK YOU WANT TO.
 
 use strict;
 
@@ -6,13 +20,24 @@ use Digest::MD5;
 use MIME::Base64;
 use POSIX;
 
+# Программа чтения журналов сервисов, парсинг и раскладывания строк 
+# по пользователям, к кторым они относятся.
+
+# установить флаг отладки
 my $debug=1;
+
+# собственный журнал
 my $log_file='/var/log/peruserlog.log';
-my $logs_template='"/var/log/peruserlog/${type}/${user}.log"';
-my $user_dir_template='"/home/${user}/syslogs"';
-my $user_logs_template='"/home/${user}/syslogs/${type}.log"';
+# шаблон имени файла дополнительного хранилища логов пользователя
+my $logs_template='"/var/log/supportlogs/${type}/${user}.log"';
+# шаблон имени файла основного хранилища логов пользователя
+my $user_logs_template='"/home/${user}/logs/${type}.log"';
+# шаблон пути проверки существования основного хранилища логов пользователя
+# в зависимости от его существования - пишем ьуда или нет
+my $user_dir_template='"/home/${user}/logs"';
 
 # конфигурация отслеживаемых журналов
+# каждый журнал смотрит своя функция
 my @logs=(
 	['/var/log/auth.log',\&parse_sshd],
 	['/var/log/cron',\&parse_cron],
@@ -21,25 +46,26 @@ my @logs=(
 	['/var/log/maillog',\&parse_mail],
 );
 
-# инода файла лога
+# инода файла собственного лога
 my $ilog;
 
-# журналы слежения
+# кэши для хранения отслеживаемых, но ещё не идентифицированных событий
 my %event_ssh=();
 my %event_ftp=();
 my %event_mail=();
-# file handler cache
+# открытые файловые дескрипторы
 my %files=();
-# warn: try to periodic clean
+# кэш ключей ssh, на самом деле его применение сомнительно
 my %ssh_pub_keys=();
 
-# запись в журнал
+# функция записи в журнал
 # ведётся учёт открытых журналов
 sub write_log($$$) {
 	my $type=shift;
 	my $user=shift;
 	my $str=shift;
 	return unless $str;
+	# обыграть неточности разбора или неясные журналы
 	$type||='unknown';
 	$user||='unknown';
 	unless (defined getpwnam($user)) {
@@ -47,23 +73,34 @@ sub write_log($$$) {
 	};
 	chomp($str);
 	my $lf;
+	# заполнить шаблон имени файла журнала
+	# способ стрёмный, но рабочий
 	$lf=eval $logs_template;
+	# записать в дополнительный журнал
 	my $lfh;
 	if (defined $files{$lf}) {
+		# если уже есть такой дескриптор - используем его
 		$lfh=$files{$lf};
 	} else {
+		# если дескриптора нет - открываем новый, отменяем буферизацию, запоминаем
 		open $lfh, ">>${lf}" or die "Cant open $lf: $!";
 		select($lfh); $|=1;select(STDOUT);
 		$files{$lf}=$lfh;
 	};
 	print $lfh "${str}\n";
+	# заполнить шаблон имени директории логов пользователя
+	# способ стрёмный, но рабочий
 	my $user_dir=eval $user_dir_template;
+	# если директория есть, записать в журнал
 	if ( -d "$user_dir" ) {
+		# и опять шаблон
 		$lf=eval $user_logs_template;
 		my $lfh;
 		if (defined $files{$lf}) {
+			# если уже есть такой дескриптор - используем его
 			$lfh=$files{$lf};
 		} else {
+			# если дескриптора нет - открываем новый, отменяем буферизацию, запоминаем
 			open $lfh, ">>${lf}" or die "Cant open $lf: $!";
 			select($lfh); $|=1;select(STDOUT);
 			$files{$lf}=$lfh;
@@ -77,6 +114,7 @@ sub write_log($$$) {
 sub get_ssh_pub_key_from_user($$) {
 	my $user=shift;
 	my $finger=shift;
+	# проверить, а нет ли такого в кэше программы
 	if (defined ($ssh_pub_keys{"${user}_${finger}"})) {
 		return $ssh_pub_keys{"${user}_${finger}"};
 	} else {
@@ -130,10 +168,12 @@ sub parse_cron($) {
 sub parse_proftpd($) {
 	my $line=shift;
 	my @l=split /\s+/,$line;
+	# проверить, сожем ли мы его разобрать
 	if (scalar(@l)<5) {
 		write_log('ftp',undef,$line);
 		return;
 	};
+	# выделить pid
 	$l[4]=~/proftpd\[(\d+)\]/;
 	my $pid=$1;
 	unless($pid) {
@@ -144,14 +184,17 @@ sub parse_proftpd($) {
 	$event_ftp{"$pid"}={'user'=>$user, 'lines'=>[]} unless $event_ftp{"$pid"};
 	(my $data = $line) =~ s/(.*proftpd\[\d+\]\s+)?//;
 	if ( $data =~ /\:\s+FTP\s+session\s+opened\./ ) {
+		# сессия открыта, начинаем запоминать
 		$event_ftp{"$pid"}{'user'}='';
 		$event_ftp{"$pid"}{'lines'}=[$line];
 	} elsif ($data =~ /\:\s+FTP\s+session\s+closed\./) {
+		# сессия закрыта, пишем и удаляем запись в памяти
 		if ($event_ftp{"$pid"}{'user'}) {
 			write_log('ftp',$event_ftp{$pid}{'user'},$line);
 		};
 		delete $event_ftp{"$pid"};
 	} elsif($data=~/\:\s+USER\s+(.*?)\:/) {
+		# пользователь нашёлся, пишем в лог всё накопленное
 		$user=$1;
 		$user=~s/^ftp\_//;
 		$user=~s/\_(\d+)$//;
@@ -161,12 +204,14 @@ sub parse_proftpd($) {
 		};
 		write_log('ftp',$user,$line);
 	} else {
+		# просто пишем в лог
 		if ($event_ftp{"$pid"}{'user'}) {
 			write_log('ftp',$event_ftp{$pid}{'user'},$line);
 		} else {
 			push @{$event_ftp{"$pid"}{'lines'}},$line;
 		};
 	};
+	# много записей - чистим
 	if (scalar(keys %event_ftp)>100) {
 		&purge_proftpd_pids();
 	};
@@ -176,10 +221,12 @@ sub parse_proftpd($) {
 sub parse_xferlog($) {
 	my $line=shift;
 	my @l=split /\s+/,$line;
+	# проверяем та ли строка
 	if (scalar(@l)!=18) {
 		write_log('ftp',undef,$line);
 		return;
 	};
+	# пишем
 	my $user=$l[13];
 	$user=~s/^ftp\_//;
 	$user=~s/\_(\d+)$//;
@@ -327,7 +374,6 @@ sub purge_ssh_pids() {
 	@seen{@a}=();
 	delete @seen{@list};
 	foreach my $key (keys %seen) {
-		# print LF "Delete pid records $key\n";
 		delete $event_ssh{"$key"};
 	};
 };
@@ -357,8 +403,10 @@ sub RECONFIG {
 	$SIG{HUP}=\&RECONFIG;
 	my $i=(stat($log_file))[1];
 	$i||=0;
+	# если наш лог врдруг поменял inode, чистим дополнительное хранилище
 	if ($ilog != $i) {
-		`find /var/log/peruserlog/ -name "*.log" -type f -delete`;
+		# This is a bit of WTF, but it works
+		`find /var/log/supportlogs/ -name "*.log" -type f -delete`;
 		close LF;
 		open LF,">>$log_file" or die;
 		$ilog=(stat(LF))[1];
@@ -373,15 +421,16 @@ sub RECONFIG {
 	};
 };
 
-# открыть файл журнала
+# открыть файл основного собственного журнала
 open LF,">>$log_file" or die;
-$ilog=(stat(LF))[1];
+$ilog=(stat(LF))[1]; # запомнить его inode
 chmod 0600, $log_file;
 select(LF); $|=1; *STDERR=\*LF; *STDOUT=\*LF;
 print LF localtime()." peruserlog\[$$\]: Starting...\n";
 
 $SIG{HUP}=\&RECONFIG;
 
+# читать журналы
 my %logfiles=();
 foreach my $log (@logs) {
 	unless (defined $logfiles{$log->[0]}) {
@@ -396,6 +445,7 @@ foreach my $log (@logs) {
 		$logfiles{$log->[0]}=[$fh,$i];
 	};
 };
+# основной цикл
 while(1) {
 	foreach my $log (@logs) {
 		unless (defined $logfiles{$log->[0]}) {
@@ -424,6 +474,7 @@ while(1) {
 		};
 		seek($fh,0,1);
 	};
+	# задержка цикла
 	select(undef,undef,undef,0.1);
 };
 
