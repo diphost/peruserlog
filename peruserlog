@@ -428,6 +428,7 @@ chmod 0600, $log_file;
 select(LF); $|=1; *STDERR=\*LF; *STDOUT=\*LF;
 print LF localtime()." peruserlog\[$$\]: Starting...\n";
 
+# установить обработчик сигнала SIGHUP
 $SIG{HUP}=\&RECONFIG;
 
 # читать журналы
