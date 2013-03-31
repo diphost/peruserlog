@@ -1,0 +1,438 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+
+use Digest::MD5;
+use MIME::Base64;
+use POSIX;
+
+my $debug=1;
+my $log_file='/var/log/peruserlog.log';
+my $logs_template='"/var/log/peruserlog/${type}/${user}.log"';
+my $user_dir_template='"/home/${user}/syslogs"';
+my $user_logs_template='"/home/${user}/syslogs/${type}.log"';
+
+# конфигурация отслеживаемых журналов
+my @logs=(
+	['/var/log/auth.log',\&parse_sshd],
+	['/var/log/cron',\&parse_cron],
+	['/var/log/proftpd.log',\&parse_proftpd],
+	['/var/log/xferlog',\&parse_xferlog],
+	['/var/log/maillog',\&parse_mail],
+);
+
+# инода файла лога
+my $ilog;
+
+# журналы слежения
+my %event_ssh=();
+my %event_ftp=();
+my %event_mail=();
+# file handler cache
+my %files=();
+# warn: try to periodic clean
+my %ssh_pub_keys=();
+
+# запись в журнал
+# ведётся учёт открытых журналов
+sub write_log($$$) {
+	my $type=shift;
+	my $user=shift;
+	my $str=shift;
+	return unless $str;
+	$type||='unknown';
+	$user||='unknown';
+	unless (defined getpwnam($user)) {
+		$user='unknown';
+	};
+	chomp($str);
+	my $lf;
+	$lf=eval $logs_template;
+	my $lfh;
+	if (defined $files{$lf}) {
+		$lfh=$files{$lf};
+	} else {
+		open $lfh, ">>${lf}" or die "Cant open $lf: $!";
+		select($lfh); $|=1;select(STDOUT);
+		$files{$lf}=$lfh;
+	};
+	print $lfh "${str}\n";
+	my $user_dir=eval $user_dir_template;
+	if ( -d "$user_dir" ) {
+		$lf=eval $user_logs_template;
+		my $lfh;
+		if (defined $files{$lf}) {
+			$lfh=$files{$lf};
+		} else {
+			open $lfh, ">>${lf}" or die "Cant open $lf: $!";
+			select($lfh); $|=1;select(STDOUT);
+			$files{$lf}=$lfh;
+		};
+		print $lfh "${str}\n";
+	};
+};
+
+# функция смотрит у пользователя ключ, соответствующий fingerprint из лога
+# возвращает аргументы, 10 символов начала 10 символов конца и комментарий ключа
+sub get_ssh_pub_key_from_user($$) {
+	my $user=shift;
+	my $finger=shift;
+	if (defined ($ssh_pub_keys{"${user}_${finger}"})) {
+		return $ssh_pub_keys{"${user}_${finger}"};
+	} else {
+		my $auth_keys_file='/home/'.${user}.'/.ssh/authorized_keys';
+		(my $finger_test=$finger)=~s/\://g;
+		if ( -f $auth_keys_file ) {
+			open FH, $auth_keys_file or return 'Unknown!';
+			while (my $str=<FH>) {
+				chomp($str);
+				my @l=split('\s',$str);
+				$str=~/^(.*\s+)?(ssh\-dss|ssh\-rsa|[0-9]*)\s+([^\s]*)(\s+.*)?$/;
+				my ($o1,$a1,$k1,$d1)=($1,$2,$3,$4);
+				$o1||='';
+				$d1||='';
+				if (Digest::MD5::md5_hex(decode_base64($k1)) eq $finger_test) {
+					$o1=~s/(^.{0,20})/$1/;
+					$k1=~s/^(.{10}).*?(.{10})$/$1\.\.\.$2/g;
+					$d1=~s/(.{0,20})$/$1/;
+					my $key="$o1 $a1 $k1 $d1";
+					$key=~s/\s+/ /g;
+					$key=~s/^\s+//;
+					$key=~s/\s+$//;
+					$ssh_pub_keys{"${user}_${finger}"}="$key";
+					last;
+				};
+			};
+			close FH;
+		};
+		if (defined ($ssh_pub_keys{"${user}_${finger}"})) {
+			return $ssh_pub_keys{"${user}_${finger}"};
+		} else {
+			return 'Unknown!';
+		};
+	};
+};
+
+# разбор строки лога cron
+sub parse_cron($) {
+	my $line=shift;
+	my @l=split /\s+/,$line;
+	if (scalar(@l)<6) {
+		write_log('cron',undef,$line);
+		return;
+	};
+	$l[5]=~/\((.*)\)/;
+	my $user=$1;
+	write_log('cron',$user,$line) if $user;
+};
+
+# разбор строки лога proftpd
+sub parse_proftpd($) {
+	my $line=shift;
+	my @l=split /\s+/,$line;
+	if (scalar(@l)<5) {
+		write_log('ftp',undef,$line);
+		return;
+	};
+	$l[4]=~/proftpd\[(\d+)\]/;
+	my $pid=$1;
+	unless($pid) {
+		write_log('ftp',undef,$line);
+		return;
+	};
+	my $user='';
+	$event_ftp{"$pid"}={'user'=>$user, 'lines'=>[]} unless $event_ftp{"$pid"};
+	(my $data = $line) =~ s/(.*proftpd\[\d+\]\s+)?//;
+	if ( $data =~ /\:\s+FTP\s+session\s+opened\./ ) {
+		$event_ftp{"$pid"}{'user'}='';
+		$event_ftp{"$pid"}{'lines'}=[$line];
+	} elsif ($data =~ /\:\s+FTP\s+session\s+closed\./) {
+		if ($event_ftp{"$pid"}{'user'}) {
+			write_log('ftp',$event_ftp{$pid}{'user'},$line);
+		};
+		delete $event_ftp{"$pid"};
+	} elsif($data=~/\:\s+USER\s+(.*?)\:/) {
+		$user=$1;
+		$user=~s/^ftp\_//;
+		$user=~s/\_(\d+)$//;
+		$event_ftp{"$pid"}{'user'}=$user;
+		while (my $s=shift(@{$event_ftp{"$pid"}{'lines'}})) {
+			write_log('ftp',$user,$s);
+		};
+		write_log('ftp',$user,$line);
+	} else {
+		if ($event_ftp{"$pid"}{'user'}) {
+			write_log('ftp',$event_ftp{$pid}{'user'},$line);
+		} else {
+			push @{$event_ftp{"$pid"}{'lines'}},$line;
+		};
+	};
+	if (scalar(keys %event_ftp)>100) {
+		&purge_proftpd_pids();
+	};
+};
+
+# разбор строки лога xferlog
+sub parse_xferlog($) {
+	my $line=shift;
+	my @l=split /\s+/,$line;
+	if (scalar(@l)!=18) {
+		write_log('ftp',undef,$line);
+		return;
+	};
+	my $user=$l[13];
+	$user=~s/^ftp\_//;
+	$user=~s/\_(\d+)$//;
+	write_log('ftp',$user,$line) if $user;
+};
+
+# разбор строки лога почты
+sub parse_mail($) {
+	my $line=shift;
+	my @l=split /\s+/,$line;
+	if (scalar(@l)<6) {
+		write_log('ftp',undef,$line);
+		return;
+	};
+	$l[5]=~/^([\w|\d]*)\:$/;
+	my $qid=$1;
+	unless ($qid) {
+		write_log('mail',undef,$line);
+		return;
+	};
+	my $user='';
+	$user=$event_mail{"$qid"} if defined $event_mail{"$qid"};
+	splice(@l,0,6);
+	my $data=join(' ',@l);
+	if ($l[0]=~/^([\w|\d]*)\:$/) {
+		my $qid1=$1;
+		if (defined $event_mail{"$qid"}) {
+			$event_mail{"$qid1"}=$event_mail{"$qid"};
+			delete $event_mail{"$qid"} unless $data =~ /sender\s+notify\:\s+Warning\:/;
+		};
+		write_log('mail',$user,$line);
+		return;
+	};
+	if ($data =~ /^Authentication\-Warning\:\s+(.*?)\:\s+(.*?)\s+/ ) {
+		$user=$2;
+		$event_mail{"$qid"}=$user;
+		write_log('mail',$user,$line);
+	} elsif ($data =~ /^from\=.*relay\=(.*?)\@localhost$/) {
+		unless (defined $event_mail{"$qid"}) {
+			$user=$1;
+			$event_mail{"$qid"}=$user;
+		};
+		write_log('mail',$user,$line);
+	} elsif ($data =~ /^to\=(.*?)\,\s+.*stat\=(.*?)$/) {
+		my $t=$1;
+		my $status=$2;
+		unless (defined $event_mail{"$qid"}) {
+			if ($t=~/^[\w|\d]+$/) {
+				$user=$t;
+				$event_mail{"$qid"}=$user;
+			};
+		};
+		if ($status =~ /^Sent\s+/) {
+			delete $event_mail{"$qid"} if defined $event_mail{"$qid"};
+		};
+		write_log('mail',$user,$line);
+	} else {
+		write_log('mail',$user,$line);
+	};
+};
+
+# разбор строки лога sshd
+sub parse_sshd($) {
+	my $line=shift;
+	my $user='';
+	my @l=split /\s+/,$line;
+	if (scalar(@l)<5) {
+		write_log('sshd',undef,$line);
+		return;
+	};
+	$l[4]=~/\[(\d+)\]/;
+	my $pid=$1;
+	unless ($pid) {
+		write_log('sshd',undef,$line);
+		return;
+	};
+	$event_ssh{"$pid"}={'user'=>$user, 'lines'=>[]} unless $event_ssh{"$pid"};
+	(my $data = $line) =~s/(.*?sshd\[\d+\]\:\s+)?//;
+	if ( $data =~ /^Accept/ ) {
+		$data =~ /^Accept.+?for\s+(.*?)\s+/;
+		$user=$1;
+		$event_ssh{"$pid"}{'user'}=$user;
+		while (my $s=shift(@{$event_ssh{"$pid"}{'lines'}})) {
+			write_log('sshd',$user,$s);
+			if ($s=~/Found\s+matching.*\s+([a-f]|[0-9]|\:){47}$/) {
+				$s=~/Found\s+matching.*\s+(([a-f]|[0-9]|\:){47})$/;
+				my $key=$1;
+				write_log('sshd',$user,"$key: ".get_ssh_pub_key_from_user($user,$key));
+			};
+		};
+		write_log('sshd',$user,$line);
+	} elsif ($data =~ /^User\s+child/) {
+		if ($event_ssh{"$pid"}{'user'}) {
+			$data =~ /^User\s+.*\s+(\d+)$/;
+			$event_ssh{"$1"}={'user'=>$event_ssh{"$pid"}{'user'}, 'lines'=>[]};
+			write_log('sshd',$event_ssh{$pid}{'user'},$line);
+		};
+	} elsif ($data =~ /^Received\s+disconnect/) {
+		if ($event_ssh{"$pid"}{'user'}) {
+			write_log('sshd',$event_ssh{$pid}{'user'},$line);
+		};
+		delete $event_ssh{"$pid"};
+	} elsif ($data =~ /^Read\s+error\s+from\s+remote\s+host/) {
+		if ($event_ssh{"$pid"}{'user'}) {
+			write_log('sshd',$event_ssh{$pid}{'user'},$line);
+		};
+		delete $event_ssh{"$pid"};
+	} elsif ($data =~ /Closing\s+connection/) {
+		if ($event_ssh{"$pid"}{'user'}) {
+			write_log('sshd',$event_ssh{$pid}{'user'},$line);
+		};
+		delete $event_ssh{"$pid"};
+	} elsif ($data=~/^Connection\s+from/) {
+		$event_ssh{"$pid"}{'user'}='';
+		$event_ssh{"$pid"}{'lines'}=[$line];
+	} else {
+		unless ($event_ssh{"$pid"}{'user'}) {
+			push @{$event_ssh{"$pid"}{'lines'}},$line;
+		} else {
+			write_log('sshd',$event_ssh{$pid}{'user'},$line);
+		};
+	};
+	if (scalar(keys %event_ssh)>100) {
+		&purge_ssh_pids();
+	};
+	if (scalar(keys %ssh_pub_keys)>100) {
+		foreach my $key (keys %ssh_pub_keys) {
+			delete $ssh_pub_keys{$key};
+		};
+	};
+};
+
+# удаляем из слежения неактуальные pid sshd
+sub purge_ssh_pids() {
+	my @ps=`/bin/ps -ax -o pid,comm | /usr/bin/grep sshd`;
+	my @list=();
+	foreach my $str (@ps) {
+		chomp($str);
+		$str =~s/^\s+//;
+		$str =~ s/^(\d+)\s+.*$/$1/;
+		push @list,$str;
+	};
+	my @a=keys %event_ssh;
+	my %seen;
+	@seen{@a}=();
+	delete @seen{@list};
+	foreach my $key (keys %seen) {
+		# print LF "Delete pid records $key\n";
+		delete $event_ssh{"$key"};
+	};
+};
+
+# удаляем из слежения неактуальные pid proftpd
+sub purge_proftpd_pids() {
+	my @ps=`/bin/ps -ax -o pid,comm | /usr/bin/grep proftpd`;
+	my @list=();
+	foreach my $str (@ps) {
+		chomp($str);
+		$str =~s/^\s+//;
+		$str =~ s/^(\d+)\s+.*$/$1/;
+		push @list,$str;
+	};
+	my @a=keys %event_ftp;
+	my %seen;
+	@seen{@a}=();
+	delete @seen{@list};
+	foreach my $key (keys %seen) {
+		delete $event_ftp{"$key"};
+	};
+};
+
+# Обработчик сигнала SIGHUP
+sub RECONFIG {
+	print LF localtime()." peruserlog\[$$\]: Reconfig...\n";
+	$SIG{HUP}=\&RECONFIG;
+	my $i=(stat($log_file))[1];
+	$i||=0;
+	if ($ilog != $i) {
+		`find /var/log/peruserlog/ -name "*.log" -type f -delete`;
+		close LF;
+		open LF,">>$log_file" or die;
+		$ilog=(stat(LF))[1];
+		chmod 0600, $log_file;
+		select(LF); $|=1; *STDERR=\*LF; *STDOUT=\*LF;
+	};
+	# закрыть все файловые дескрипторы
+	foreach my $fn (keys %files) {
+		my $h=$files{$fn};
+		delete $files{$fn};
+		close($h);
+	};
+};
+
+# открыть файл журнала
+open LF,">>$log_file" or die;
+$ilog=(stat(LF))[1];
+chmod 0600, $log_file;
+select(LF); $|=1; *STDERR=\*LF; *STDOUT=\*LF;
+print LF localtime()." peruserlog\[$$\]: Starting...\n";
+
+$SIG{HUP}=\&RECONFIG;
+
+my %logfiles=();
+foreach my $log (@logs) {
+	unless (defined $logfiles{$log->[0]}) {
+		$logfiles{$log->[0]}=[undef,0];
+	};
+	my $fh=$logfiles{$log->[0]}->[0];
+	unless($fh) {
+		open $fh, "$log->[0]" or print localtime()." peruserlog\[$$\]: Can't open $log->[0]: $!";
+		next unless $fh;
+		my $i=(stat($fh))[1];
+		seek($fh,0,2); # идём в хвост лога
+		$logfiles{$log->[0]}=[$fh,$i];
+	};
+};
+while(1) {
+	foreach my $log (@logs) {
+		unless (defined $logfiles{$log->[0]}) {
+			$logfiles{$log->[0]}=[undef,0];
+		} else {
+			# проверка, что лог ещё тот за кого выдаёт
+			my $i=(stat($log->[0]))[1];
+			if (defined $i and ($i != $logfiles{$log->[0]}->[1])) {
+				my $fh=$logfiles{$log->[0]}->[0];
+				if ($fh) {
+					close $fh;
+				};
+				$logfiles{$log->[0]}->[0]=undef;
+			};
+		};
+		my $fh=$logfiles{$log->[0]}->[0];
+		unless($fh) {
+			open $fh, "$log->[0]" or print localtime()." peruserlog\[$$\]: Can't open $log->[0]: $!";
+			next unless $fh;
+			my $i=(stat($fh))[1];
+			seek($fh,0,0);
+			$logfiles{$log->[0]}=[$fh,$i];
+		};
+		while(my $str=<$fh>) {
+			$log->[1]->($str);
+		};
+		seek($fh,0,1);
+	};
+	select(undef,undef,undef,0.1);
+};
+
+# закрыть все файловые дескрипторы
+foreach my $fn (keys %files) {
+	close($files{$fn});
+};
+
+print LF localtime()." peruserlog\[$$\]: Stopping\n";
+close LF;
+
+exit 0;
